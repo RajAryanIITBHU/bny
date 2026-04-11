@@ -43,7 +43,7 @@ export default function RootLayout({
         className={cn("h-full", "antialiased", notoSerif.variable, geistSans.variable, geistMono.variable, inter.variable)}
       >
         <body className={cn("min-h-full flex flex-col", inter.className)}>
-          <Header />
+          {/* <Header /> */}
           {children}
         </body>
       </html>
