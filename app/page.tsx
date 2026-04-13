@@ -11,20 +11,18 @@ import {
   Download,
   Zap,
   ArrowUpDown,
+  Settings2,
+  RotateCcw,
+  Undo2,
 } from "lucide-react";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { useDropzone } from "react-dropzone";
 
 // ─────────────────────────────────────────────────────────────
 // TYPES
 // ─────────────────────────────────────────────────────────────
 type Rec = Record<string, any>;
-
-type Cluster = {
-  type: "EXACT_SSN" | "FUZZY_SSN_TYPO";
-  records: Rec[];
-};
-
+type Cluster = { type: "EXACT_SSN" | "FUZZY_SSN_TYPO"; records: Rec[] };
 type FieldAgreement = {
   score: number;
   status: "agree" | "null" | "conflict";
@@ -33,12 +31,10 @@ type FieldAgreement = {
   canonical_val: any;
   rule: string;
 };
-
 type ScoredRecord = Rec & {
   record_confidence: number;
   field_breakdown: Record<string, FieldAgreement>;
 };
-
 type ScoredGroup = {
   ssn: string;
   group_avg_confidence: number;
@@ -47,9 +43,7 @@ type ScoredGroup = {
   records: ScoredRecord[];
   requiresReview: boolean;
 };
-
 type MergeDecision = "approved" | "rejected" | "pending";
-
 type AuditEntry = {
   timestamp: string;
   ssn_masked: string;
@@ -65,29 +59,74 @@ type AuditEntry = {
   record_scores: { record_id: string; confidence: number }[];
   decision: "approved" | "rejected";
 };
-
 type AppData = {
   records: Rec[];
   clusters: Cluster[];
   batches: Cluster[][];
   fileName: string;
 };
-
 type Message = { id: string; text: string; sender: "user" | "ai" };
+type Action = {
+  id: string;
+  timestamp: number;
+  type: "approve" | "reject" | "approve_all";
+  clusterKey: string;
+  previousDecision: MergeDecision;
+  auditEntry?: AuditEntry;
+};
 
 // ─────────────────────────────────────────────────────────────
-// CONFIDENCE SCORING ENGINE
+// RULE DEFINITIONS
 // ─────────────────────────────────────────────────────────────
-const FIELD_WEIGHTS: Record<string, number> = {
-  date_of_birth: 0.35,
+type RuleKey =
+  | "most_frequent"
+  | "most_recent"
+  | "earliest_entry"
+  | "longest_value"
+  | "shortest_value"
+  | "highest_value"
+  | "lowest_value"
+  | "fuzzy_match_most_recent"
+  | "most_complete";
+
+const RULE_LABELS: Record<RuleKey, string> = {
+  most_frequent: "Most frequent",
+  most_recent: "Most recent (created_at ↓)",
+  earliest_entry: "Earliest entry (created_at ↑)",
+  longest_value: "Longest value",
+  shortest_value: "Shortest value",
+  highest_value: "Highest numeric value",
+  lowest_value: "Lowest numeric value",
+  fuzzy_match_most_recent: "Fuzzy match + most recent",
+  most_complete: "Most complete (non-null preferred)",
+};
+
+const RULE_DESCRIPTIONS: Record<RuleKey, string> = {
+  most_frequent: "Pick whichever value appears most times across records",
+  most_recent: "Pick value from the most recently created record",
+  earliest_entry: "Pick value from the oldest/earliest record",
+  longest_value: "Pick the longest string value",
+  shortest_value: "Pick the shortest non-empty string value",
+  highest_value: "Pick the highest numeric value",
+  lowest_value: "Pick the lowest numeric value",
+  fuzzy_match_most_recent:
+    "Normalize address abbreviations, then pick most recent",
+  most_complete: "Prefer non-null; among non-nulls pick most frequent",
+};
+
+// ─────────────────────────────────────────────────────────────
+// DEFAULT CONFIG
+// ─────────────────────────────────────────────────────────────
+const DEFAULT_FIELD_WEIGHTS: Record<string, number> = {
+  date_of_birth: 0.25,
   last_name: 0.25,
   first_name: 0.2,
   phone_number: 0.1,
-  address: 0.05,
-  email: 0.05,
+  address: 0.1,
+  email: 0.1,
 };
 
-const FIELD_RULES: Record<string, string> = {
+const DEFAULT_FIELD_RULES: Record<string, RuleKey> = {
   first_name: "most_frequent",
   last_name: "most_frequent",
   date_of_birth: "most_frequent",
@@ -96,6 +135,25 @@ const FIELD_RULES: Record<string, string> = {
   address: "fuzzy_match_most_recent",
 };
 
+const SCORED_FIELDS = Object.keys(DEFAULT_FIELD_WEIGHTS);
+
+type FieldRuleConfig = { rule: RuleKey; weight: number };
+type RuleConfig = Record<string, FieldRuleConfig>;
+
+function getDefaultRuleConfig(): RuleConfig {
+  const cfg: RuleConfig = {};
+  for (const f of SCORED_FIELDS) {
+    cfg[f] = {
+      rule: DEFAULT_FIELD_RULES[f] ?? "most_frequent",
+      weight: DEFAULT_FIELD_WEIGHTS[f],
+    };
+  }
+  return cfg;
+}
+
+// ─────────────────────────────────────────────────────────────
+// ADDRESS NORMALIZATION
+// ─────────────────────────────────────────────────────────────
 const ADDRESS_ABBRS: Record<string, string> = {
   street: "st",
   "st.": "st",
@@ -124,51 +182,101 @@ const ADDRESS_ABBRS: Record<string, string> = {
   parkway: "pkwy",
   "pkwy.": "pkwy",
 };
-
 function normAddr(addr: string): string {
   if (!addr) return "";
-  let s = addr.toLowerCase().replace(/[.,]/g, "");
-  return s
+  return addr
+    .toLowerCase()
+    .replace(/[.,]/g, "")
     .split(" ")
     .map((t) => ADDRESS_ABBRS[t] ?? t)
     .join(" ")
     .trim();
 }
 
-function mostFrequent(values: any[]): any {
-  const vals = values.filter(Boolean);
-  if (!vals.length) return null;
-  const cnt: Record<string, number> = {};
-  for (const v of vals) cnt[String(v)] = (cnt[String(v)] ?? 0) + 1;
-  return vals.reduce((a, b) => (cnt[String(a)] >= cnt[String(b)] ? a : b));
+// ─────────────────────────────────────────────────────────────
+// RULE APPLICATORS
+// ─────────────────────────────────────────────────────────────
+function applyRule(field: string, rule: RuleKey, records: Rec[]): any {
+  const vals = records.map((r) => r[field]);
+  switch (rule) {
+    case "most_frequent": {
+      const nv = vals.filter(Boolean);
+      if (!nv.length) return null;
+      const cnt: Record<string, number> = {};
+      for (const v of nv) cnt[String(v)] = (cnt[String(v)] ?? 0) + 1;
+      return nv.reduce((a, b) => (cnt[String(a)] >= cnt[String(b)] ? a : b));
+    }
+    case "most_recent": {
+      const sorted = [...records].sort((a, b) =>
+        (b.created_at ?? "").localeCompare(a.created_at ?? ""),
+      );
+      return sorted[0]?.[field] ?? null;
+    }
+    case "earliest_entry": {
+      const sorted = [...records].sort((a, b) =>
+        (a.created_at ?? "").localeCompare(b.created_at ?? ""),
+      );
+      return sorted[0]?.[field] ?? null;
+    }
+    case "longest_value": {
+      const nv = vals.filter((v) => v != null && String(v).trim() !== "");
+      if (!nv.length) return null;
+      return nv.reduce((a, b) =>
+        String(a).length >= String(b).length ? a : b,
+      );
+    }
+    case "shortest_value": {
+      const nv = vals.filter((v) => v != null && String(v).trim() !== "");
+      if (!nv.length) return null;
+      return nv.reduce((a, b) =>
+        String(a).length <= String(b).length ? a : b,
+      );
+    }
+    case "highest_value": {
+      const nv = vals.filter((v) => v != null && !isNaN(Number(v)));
+      if (!nv.length) return null;
+      return nv.reduce((a, b) => (Number(a) >= Number(b) ? a : b));
+    }
+    case "lowest_value": {
+      const nv = vals.filter((v) => v != null && !isNaN(Number(v)));
+      if (!nv.length) return null;
+      return nv.reduce((a, b) => (Number(a) <= Number(b) ? a : b));
+    }
+    case "fuzzy_match_most_recent": {
+      const addrGroups: Record<string, Rec[]> = {};
+      for (const r of records) {
+        const key = normAddr(r[field] ?? "");
+        (addrGroups[key] = addrGroups[key] ?? []).push(r);
+      }
+      const largest =
+        Object.values(addrGroups).sort((a, b) => b.length - a.length)[0] ??
+        records;
+      const sorted = [...largest].sort((a, b) =>
+        (b.created_at ?? "").localeCompare(a.created_at ?? ""),
+      );
+      return sorted[0]?.[field] ?? null;
+    }
+    case "most_complete": {
+      const nv = vals.filter((v) => v != null && String(v).trim() !== "");
+      if (!nv.length) return null;
+      const cnt: Record<string, number> = {};
+      for (const v of nv) cnt[String(v)] = (cnt[String(v)] ?? 0) + 1;
+      return nv.reduce((a, b) => (cnt[String(a)] >= cnt[String(b)] ? a : b));
+    }
+    default:
+      return null;
+  }
 }
 
-function mostRecent(records: Rec[], field: string): any {
-  const sorted = [...records].sort((a, b) =>
-    (b.created_at ?? "").localeCompare(a.created_at ?? ""),
-  );
-  return sorted[0]?.[field] ?? null;
-}
-
-function buildCanonical(records: Rec[]): Rec {
+// ─────────────────────────────────────────────────────────────
+// CANONICAL + SCORING
+// ─────────────────────────────────────────────────────────────
+function buildCanonical(records: Rec[], ruleConfig: RuleConfig): Rec {
   const canon: Rec = {};
-  for (const f of [
-    "first_name",
-    "last_name",
-    "date_of_birth",
-    "phone_number",
-  ]) {
-    canon[f] = mostFrequent(records.map((r) => r[f]));
+  for (const field of SCORED_FIELDS) {
+    const cfg = ruleConfig[field];
+    if (cfg) canon[field] = applyRule(field, cfg.rule, records);
   }
-  canon.email = mostRecent(records, "email");
-  const addrGroups: Record<string, Rec[]> = {};
-  for (const r of records) {
-    const key = normAddr(r.address ?? "");
-    (addrGroups[key] = addrGroups[key] ?? []).push(r);
-  }
-  const largest =
-    Object.values(addrGroups).sort((a, b) => b.length - a.length)[0] ?? records;
-  canon.address = mostRecent(largest, "address");
   canon.ssn = records[0].ssn;
   const oldest = [...records].sort((a, b) =>
     (a.created_at ?? "").localeCompare(b.created_at ?? ""),
@@ -182,14 +290,16 @@ function fieldAgreement(
   recordVal: any,
   canonicalVal: any,
   field: string,
+  rule: RuleKey,
 ): { score: number; status: "agree" | "null" | "conflict" } {
-  if (!recordVal) return { score: 0.5, status: "null" };
-  if (field === "address") {
-    return normAddr(recordVal) === normAddr(canonicalVal)
+  if (recordVal == null || String(recordVal).trim() === "")
+    return { score: 0.5, status: "null" };
+  if (rule === "fuzzy_match_most_recent") {
+    return normAddr(String(recordVal)) === normAddr(String(canonicalVal ?? ""))
       ? { score: 1.0, status: "agree" }
       : { score: 0.0, status: "conflict" };
   }
-  return recordVal === canonicalVal
+  return String(recordVal) === String(canonicalVal ?? "")
     ? { score: 1.0, status: "agree" }
     : { score: 0.0, status: "conflict" };
 }
@@ -197,32 +307,39 @@ function fieldAgreement(
 function calcRecordConfidence(
   record: Rec,
   canonical: Rec,
+  ruleConfig: RuleConfig,
 ): { score: number; fields: Record<string, FieldAgreement> } {
   let weightedSum = 0,
     totalWeight = 0;
   const fieldScores: Record<string, FieldAgreement> = {};
-  for (const [field, weight] of Object.entries(FIELD_WEIGHTS)) {
-    const ag = fieldAgreement(record[field], canonical[field], field);
+  for (const field of SCORED_FIELDS) {
+    const cfg = ruleConfig[field];
+    if (!cfg) continue;
+    const ag = fieldAgreement(record[field], canonical[field], field, cfg.rule);
     fieldScores[field] = {
       ...ag,
-      weight,
+      weight: cfg.weight,
       record_val: record[field],
       canonical_val: canonical[field],
-      rule: FIELD_RULES[field] ?? "most_frequent",
+      rule: cfg.rule,
     };
-    weightedSum += ag.score * weight;
-    totalWeight += weight;
+    weightedSum += ag.score * cfg.weight;
+    totalWeight += cfg.weight;
   }
   return {
-    score: Math.round((weightedSum / totalWeight) * 100),
+    score: totalWeight > 0 ? Math.round((weightedSum / totalWeight) * 100) : 0,
     fields: fieldScores,
   };
 }
 
-function scoreGroup(ssn: string, records: Rec[]): ScoredGroup {
-  const canonical = buildCanonical(records);
+function scoreGroup(
+  ssn: string,
+  records: Rec[],
+  ruleConfig: RuleConfig,
+): ScoredGroup {
+  const canonical = buildCanonical(records, ruleConfig);
   const scoredRecords: ScoredRecord[] = records.map((r) => {
-    const conf = calcRecordConfidence(r, canonical);
+    const conf = calcRecordConfidence(r, canonical, ruleConfig);
     return {
       ...r,
       record_confidence: conf.score,
@@ -273,14 +390,12 @@ function getCandidateClusters(data: Rec[]): Cluster[] {
   }
   return clusters;
 }
-
 function makeBatches(clusters: Cluster[], size = 3): Cluster[][] {
-  const batches: Cluster[][] = [];
+  const b: Cluster[][] = [];
   for (let i = 0; i < clusters.length; i += size)
-    batches.push(clusters.slice(i, i + size));
-  return batches;
+    b.push(clusters.slice(i, i + size));
+  return b;
 }
-
 function getFields(records: Rec[]): string[] {
   const keys = new Set<string>();
   records
@@ -301,11 +416,11 @@ function getFields(records: Rec[]): string[] {
   keys.forEach((k) => {
     if (!sorted.includes(k)) sorted.push(k);
   });
-  return sorted.slice(0, 8);
+  return sorted.slice(0, 9);
 }
 
 // ─────────────────────────────────────────────────────────────
-// EXPORT HELPERS
+// EXPORT
 // ─────────────────────────────────────────────────────────────
 function downloadJSON(data: any, filename: string) {
   const blob = new Blob([JSON.stringify(data, null, 2)], {
@@ -356,14 +471,214 @@ function ConfidenceBadge({ score }: { score: number }) {
       : score >= 65
         ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
         : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300";
-  const label = score >= 85 ? "High" : score >= 65 ? "Medium" : "Low";
   return (
     <span
       className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full ${color}`}
     >
       <span className="w-1.5 h-1.5 rounded-full bg-current opacity-80" />
-      {score}% · {label}
+      {score}% · {score >= 85 ? "High" : score >= 65 ? "Medium" : "Low"}
     </span>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────
+// RULE CONFIG PANEL
+// ─────────────────────────────────────────────────────────────
+function RuleConfigPanel({
+  ruleConfig,
+  onChange,
+}: {
+  ruleConfig: RuleConfig;
+  onChange: (cfg: RuleConfig) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const totalWeight = Object.values(ruleConfig).reduce(
+    (s, c) => s + c.weight,
+    0,
+  );
+  const weightOk = Math.abs(totalWeight - 1) < 0.001;
+  const customCount = Object.entries(ruleConfig).filter(
+    ([f, c]) =>
+      c.rule !== (DEFAULT_FIELD_RULES[f] ?? "most_frequent") ||
+      Math.abs(c.weight - (DEFAULT_FIELD_WEIGHTS[f] ?? 0)) > 0.001,
+  ).length;
+
+  return (
+    <div className="border border-zinc-200 dark:border-zinc-700 rounded-xl overflow-hidden shadow-sm">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center justify-between px-4 py-3 bg-zinc-50 dark:bg-zinc-800/60 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+      >
+        <div className="flex items-center gap-2.5">
+          <Settings2 className="w-4 h-4 text-zinc-500" />
+          <span className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
+            Field Rule Configuration
+          </span>
+          {customCount > 0 && (
+            <span className="text-xs px-1.5 py-0.5 rounded-full font-medium bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300">
+              {customCount} custom
+            </span>
+          )}
+          <span
+            className={`text-xs px-1.5 py-0.5 rounded-full font-medium ${weightOk ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300" : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"}`}
+          >
+            Σw = {totalWeight.toFixed(2)}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onChange(getDefaultRuleConfig());
+            }}
+            className="flex items-center gap-1 text-xs text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200 transition-colors px-2 py-1 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700"
+          >
+            <RotateCcw className="w-3 h-3" /> Reset all
+          </button>
+          {open ? (
+            <ChevronUp className="w-4 h-4 text-zinc-400" />
+          ) : (
+            <ChevronDown className="w-4 h-4 text-zinc-400" />
+          )}
+        </div>
+      </button>
+
+      {open && (
+        <div className="bg-white dark:bg-zinc-900/40">
+          <div className="flex items-center gap-4 px-4 py-2 border-b border-zinc-100 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30">
+            <span className="text-xs text-zinc-400">Legend:</span>
+            <span className="flex items-center gap-1 text-xs text-zinc-500">
+              <span className="w-2 h-2 rounded-full bg-violet-400 inline-block" />{" "}
+              Custom rule/weight
+            </span>
+            <span className="flex items-center gap-1 text-xs text-zinc-500">
+              <span className="w-2 h-2 rounded-full bg-zinc-300 dark:bg-zinc-600 inline-block" />{" "}
+              Default
+            </span>
+          </div>
+
+          <div className="grid grid-cols-[10px_150px_1fr_110px_70px] gap-2 px-4 py-2 border-b border-zinc-100 dark:border-zinc-800">
+            <span />
+            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">
+              Field
+            </span>
+            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">
+              Selection Rule
+            </span>
+            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide text-center">
+              Weight (0–1)
+            </span>
+            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide text-center">
+              Reset
+            </span>
+          </div>
+
+          <div className="divide-y divide-zinc-50 dark:divide-zinc-800">
+            {Object.entries(ruleConfig).map(([field, cfg]) => {
+              const isDefaultRule =
+                cfg.rule === (DEFAULT_FIELD_RULES[field] ?? "most_frequent");
+              const isDefaultWeight =
+                Math.abs(cfg.weight - (DEFAULT_FIELD_WEIGHTS[field] ?? 0)) <
+                0.001;
+              const isDefault = isDefaultRule && isDefaultWeight;
+              return (
+                <div
+                  key={field}
+                  className={`grid grid-cols-[10px_150px_1fr_110px_70px] gap-2 items-center px-4 py-2 transition-colors ${!isDefault ? "bg-violet-50/40 dark:bg-violet-950/10" : "hover:bg-zinc-50 dark:hover:bg-zinc-800/30"}`}
+                >
+                  <div
+                    className={`w-2 h-2 rounded-full shrink-0 ${!isDefault ? "bg-violet-400" : "bg-zinc-200 dark:bg-zinc-700"}`}
+                  />
+                  <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300 truncate">
+                    {field}
+                  </span>
+
+                  <select
+                    value={cfg.rule}
+                    title={RULE_DESCRIPTIONS[cfg.rule]}
+                    onChange={(e) =>
+                      onChange({
+                        ...ruleConfig,
+                        [field]: { ...cfg, rule: e.target.value as RuleKey },
+                      })
+                    }
+                    className={`text-xs px-2 py-1.5 rounded-lg border focus:outline-none focus:ring-1 focus:ring-blue-400 transition-colors ${!isDefaultRule ? "border-violet-300 dark:border-violet-700 bg-violet-50 dark:bg-violet-950/20 text-violet-800 dark:text-violet-200" : "border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-800 dark:text-zinc-200"}`}
+                  >
+                    {(Object.keys(RULE_LABELS) as RuleKey[]).map((r) => (
+                      <option key={r} value={r}>
+                        {RULE_LABELS[r]}
+                      </option>
+                    ))}
+                  </select>
+
+                  <div className="flex flex-col gap-1">
+                    <input
+                      type="number"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      value={cfg.weight}
+                      onChange={(e) => {
+                        const v = Math.max(
+                          0,
+                          Math.min(1, parseFloat(e.target.value) || 0),
+                        );
+                        onChange({
+                          ...ruleConfig,
+                          [field]: { ...cfg, weight: v },
+                        });
+                      }}
+                      className={`w-full text-xs px-2 py-1.5 rounded-lg border focus:outline-none focus:ring-1 focus:ring-blue-400 text-center transition-colors ${!isDefaultWeight ? "border-violet-300 dark:border-violet-700 bg-violet-50 dark:bg-violet-950/20 text-violet-800 dark:text-violet-200 font-medium" : "border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-800 dark:text-zinc-200"}`}
+                    />
+                  </div>
+
+                  <div className="flex justify-center">
+                    {!isDefault ? (
+                      <button
+                        onClick={() =>
+                          onChange({
+                            ...ruleConfig,
+                            [field]: {
+                              rule:
+                                DEFAULT_FIELD_RULES[field] ?? "most_frequent",
+                              weight: DEFAULT_FIELD_WEIGHTS[field] ?? 0.1,
+                            },
+                          })
+                        }
+                        className="text-xs text-violet-500 hover:text-violet-700 dark:hover:text-violet-300 transition-colors px-1.5 py-0.5 rounded hover:bg-violet-50 dark:hover:bg-violet-900/20 whitespace-nowrap"
+                      >
+                        ↩ reset
+                      </button>
+                    ) : (
+                      <span className="text-xs text-zinc-300 dark:text-zinc-700">
+                        —
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="px-4 py-3 border-t border-zinc-100 dark:border-zinc-800 flex items-center justify-between">
+            {!weightOk && (
+              <span className="text-xs text-amber-600 dark:text-amber-400 flex items-center gap-1">
+                ⚠ Weights sum to {totalWeight.toFixed(2)} — scores normalised
+                automatically
+              </span>
+            )}
+            {weightOk && (
+              <span className="text-xs text-emerald-600 dark:text-emerald-400">
+                ✓ Weights sum to 1.00
+              </span>
+            )}
+            <span className="text-xs text-zinc-400">
+              Changes apply live — all scores recalculate instantly
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -375,36 +690,42 @@ function MergePanel({
   onApprove,
   onReject,
   decision,
+  ruleConfig,
 }: {
   cluster: Cluster;
   onApprove: (sg: ScoredGroup, overrides: Record<string, any>) => void;
   onReject: (sg: ScoredGroup) => void;
   decision: MergeDecision;
+  ruleConfig: RuleConfig;
 }) {
   const sg = useMemo(
-    () => scoreGroup(cluster.records[0]?.ssn ?? "??", cluster.records),
-    [cluster],
+    () =>
+      scoreGroup(cluster.records[0]?.ssn ?? "??", cluster.records, ruleConfig),
+    [cluster, ruleConfig],
   );
   const [expanded, setExpanded] = useState(false);
   const [fieldOverrides, setFieldOverrides] = useState<Record<string, any>>({});
   const fields = getFields(cluster.records);
-  const scoreFields = Object.keys(FIELD_WEIGHTS);
+  const scoreFields = Object.keys(ruleConfig);
 
-  // Get all unique values for a given field across all records
   const getFieldOptions = (field: string): any[] => {
     const seen = new Set<string>();
     const opts: any[] = [];
     for (const r of sg.records) {
       const v = r[field];
-      if (v !== undefined && v !== null && !seen.has(String(v))) {
+      if (
+        v !== undefined &&
+        v !== null &&
+        String(v).trim() !== "" &&
+        !seen.has(String(v))
+      ) {
         seen.add(String(v));
         opts.push(v);
       }
     }
     return opts;
   };
-
-  const getEffectiveCanonicalValue = (field: string) =>
+  const getEffectiveVal = (field: string) =>
     fieldOverrides[field] !== undefined
       ? fieldOverrides[field]
       : sg.canonical[field];
@@ -419,14 +740,9 @@ function MergePanel({
             : "border-zinc-200 dark:border-zinc-700"
       }`}
     >
-      {/* Header */}
       <div className="flex flex-wrap items-center gap-2 px-4 py-2.5 bg-zinc-50 dark:bg-zinc-800/60 border-b border-zinc-200 dark:border-zinc-700">
         <span
-          className={`text-xs font-medium px-2 py-0.5 rounded-full ${
-            cluster.type === "EXACT_SSN"
-              ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
-              : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
-          }`}
+          className={`text-xs font-medium px-2 py-0.5 rounded-full ${cluster.type === "EXACT_SSN" ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300" : "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"}`}
         >
           {cluster.type === "EXACT_SSN" ? "Exact SSN" : "Fuzzy match"}
         </span>
@@ -434,13 +750,10 @@ function MergePanel({
           {cluster.records.length} records
         </span>
         <span className="text-xs text-zinc-400 dark:text-zinc-600">·</span>
-        <span className="text-xs text-zinc-500 dark:text-zinc-400">
-          Group confidence:
-        </span>
         <ConfidenceBadge score={sg.group_avg_confidence} />
         {sg.requiresReview && (
           <span className="text-xs font-medium px-2 py-0.5 rounded-full bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300">
-            ⚠ Manual review required
+            ⚠ Review
           </span>
         )}
         {Object.keys(fieldOverrides).length > 0 && (
@@ -477,7 +790,6 @@ function MergePanel({
         )}
       </div>
 
-      {/* Source records table */}
       <div className="overflow-x-auto">
         <table className="w-full text-xs border-b border-zinc-100 dark:border-zinc-800">
           <thead>
@@ -525,7 +837,7 @@ function MergePanel({
                       {isOutlier && (
                         <span
                           className="text-orange-500 text-xs"
-                          title="Outlier record"
+                          title="Outlier"
                         >
                           ⚠
                         </span>
@@ -539,7 +851,6 @@ function MergePanel({
         </table>
       </div>
 
-      {/* Merge recommendation (expandable) with manual override dropdowns */}
       <div className="bg-emerald-50/60 dark:bg-emerald-950/20 border-t border-emerald-200 dark:border-emerald-900/40">
         <button
           onClick={() => setExpanded(!expanded)}
@@ -547,8 +858,7 @@ function MergePanel({
         >
           <span className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-emerald-500" />
-            Proposed canonical record · {sg.group_avg_confidence}% group
-            confidence
+            Proposed canonical · {sg.group_avg_confidence}% confidence
             {Object.keys(fieldOverrides).length > 0 &&
               " · manual overrides applied"}
           </span>
@@ -566,13 +876,21 @@ function MergePanel({
               <span className="font-mono font-medium">
                 {sg.canonical.record_id}
               </span>
-              {" · "}Use dropdowns to override any field value.
+              {" · "}Select a value from the dropdown to override the
+              auto-selected canonical.
             </p>
             <div className="grid gap-2">
               {scoreFields.map((field) => {
+                const cfg = ruleConfig[field];
                 const options = getFieldOptions(field);
-                const effectiveVal = getEffectiveCanonicalValue(field);
+                const effectiveVal = getEffectiveVal(field);
                 const isOverridden = fieldOverrides[field] !== undefined;
+                const isCustomRule =
+                  cfg?.rule !== (DEFAULT_FIELD_RULES[field] ?? "most_frequent");
+                const isCustomWeight =
+                  Math.abs(
+                    (cfg?.weight ?? 0) - (DEFAULT_FIELD_WEIGHTS[field] ?? 0),
+                  ) > 0.001;
                 const allStatuses = sg.records.map(
                   (r) => r.field_breakdown[field]?.status,
                 );
@@ -593,22 +911,38 @@ function MergePanel({
                     sg.records.length) *
                     100,
                 );
+
                 return (
                   <div
                     key={field}
-                    className={`flex items-start gap-3 py-2 px-3 bg-white dark:bg-zinc-900/60 rounded-lg border ${isOverridden ? "border-blue-300 dark:border-blue-700" : "border-emerald-200 dark:border-emerald-900/40"}`}
+                    className={`flex items-start gap-3 py-2 px-3 bg-white dark:bg-zinc-900/60 rounded-lg border ${
+                      isOverridden
+                        ? "border-blue-300 dark:border-blue-700"
+                        : isCustomRule || isCustomWeight
+                          ? "border-violet-200 dark:border-violet-800"
+                          : "border-emerald-200 dark:border-emerald-900/40"
+                    }`}
                   >
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                      <div className="flex items-center gap-1.5 mb-1.5 flex-wrap">
                         <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
                           {field}
                         </span>
-                        <span className="text-xs text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-1.5 py-0.5 rounded">
-                          {FIELD_RULES[field]}
+                        <span
+                          className={`text-xs px-1.5 py-0.5 rounded font-mono text-[10px] ${isCustomRule ? "bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300" : "bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400"}`}
+                        >
+                          {RULE_LABELS[cfg?.rule ?? "most_frequent"]}
                         </span>
-                        <span className="text-xs text-zinc-400">
-                          w={FIELD_WEIGHTS[field]}
+                        <span
+                          className={`text-xs ${isCustomWeight ? "text-violet-600 dark:text-violet-400 font-semibold" : "text-zinc-400"}`}
+                        >
+                          w={cfg?.weight ?? 0}
                         </span>
+                        {(isCustomRule || isCustomWeight) && !isOverridden && (
+                          <span className="text-[10px] text-violet-500 font-medium">
+                            ✦ custom rule
+                          </span>
+                        )}
                         {isOverridden && (
                           <span className="text-xs font-medium text-blue-600 dark:text-blue-400 flex items-center gap-0.5">
                             ✎ overridden
@@ -628,14 +962,14 @@ function MergePanel({
                           </span>
                         )}
                       </div>
-                      {/* Manual override dropdown */}
                       <select
                         value={String(effectiveVal ?? "")}
                         onChange={(e) => {
                           const chosen = options.find(
                             (o) => String(o) === e.target.value,
                           );
-                          if (chosen === sg.canonical[field]) {
+                          const autoVal = sg.canonical[field];
+                          if (String(chosen) === String(autoVal ?? "")) {
                             setFieldOverrides((prev) => {
                               const n = { ...prev };
                               delete n[field];
@@ -660,20 +994,16 @@ function MergePanel({
                         {options.map((opt, i) => (
                           <option key={i} value={String(opt)}>
                             {String(opt)}
-                            {opt === sg.canonical[field] ? " (auto)" : ""}
+                            {String(opt) === String(sg.canonical[field] ?? "")
+                              ? " (auto)"
+                              : ""}
                           </option>
                         ))}
                       </select>
                     </div>
                     <div className="flex flex-col items-end gap-1 shrink-0 pt-6">
                       <span
-                        className={`text-xs font-medium px-1.5 py-0.5 rounded ${
-                          fieldScore >= 85
-                            ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400"
-                            : fieldScore >= 50
-                              ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400"
-                              : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400"
-                        }`}
+                        className={`text-xs font-medium px-1.5 py-0.5 rounded ${fieldScore >= 85 ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400" : fieldScore >= 50 ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400" : "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400"}`}
                       >
                         {fieldScore}%
                       </span>
@@ -709,36 +1039,24 @@ function AuditLogPanel({
   entries,
   allRecords,
   clusters,
-  decisions,
+  onUndo,
 }: {
   entries: AuditEntry[];
   allRecords: Rec[];
   clusters: Cluster[];
-  decisions: Record<string, MergeDecision>;
+  onUndo?: (entry: AuditEntry) => void;
 }) {
   const handleExportAll = () => {
-    // merged_clients.json: canonical records for approved merges + untouched records
     const approvedEntries = entries.filter((e) => e.decision === "approved");
     const retiredIds = new Set(
       approvedEntries.flatMap((e) => e.retired_record_ids),
     );
-    const canonicalIds = new Set(
-      approvedEntries.map((e) => e.canonical_record_id),
+    const mergedClients = allRecords.filter(
+      (r) => !retiredIds.has(r.record_id ?? r.id),
     );
-    const allDupRecordIds = new Set(
-      clusters.flatMap((c) => c.records.map((r) => r.record_id ?? r.id)),
-    );
-
-    const mergedClients = allRecords.filter((r) => {
-      const rid = r.record_id ?? r.id;
-      if (retiredIds.has(rid)) return false;
-      return true;
-    });
-
     const duplicatesRemoved = allRecords.filter((r) =>
       retiredIds.has(r.record_id ?? r.id),
     );
-
     downloadJSON(mergedClients, "merged_clients.json");
     setTimeout(
       () => downloadJSON(duplicatesRemoved, "duplicates_removed.json"),
@@ -747,14 +1065,13 @@ function AuditLogPanel({
     setTimeout(() => downloadJSON(entries, "audit_log.json"), 600);
   };
 
-  if (!entries.length) {
+  if (!entries.length)
     return (
       <div className="flex flex-col items-center justify-center py-16 text-zinc-400 dark:text-zinc-600">
         <ClipboardList className="w-8 h-8 mb-2 opacity-40" />
         <p className="text-sm">No merge actions taken yet.</p>
       </div>
     );
-  }
 
   return (
     <div className="p-6 space-y-4">
@@ -772,11 +1089,7 @@ function AuditLogPanel({
       {entries.map((entry, i) => (
         <div
           key={i}
-          className={`border rounded-xl p-4 text-xs space-y-2 ${
-            entry.decision === "approved"
-              ? "border-emerald-200 dark:border-emerald-800 bg-emerald-50/30 dark:bg-emerald-950/20"
-              : "border-red-200 dark:border-red-800 bg-red-50/30 dark:bg-red-950/20"
-          }`}
+          className={`border rounded-xl p-4 text-xs space-y-2 ${entry.decision === "approved" ? "border-emerald-200 dark:border-emerald-800 bg-emerald-50/30 dark:bg-emerald-950/20" : "border-red-200 dark:border-red-800 bg-red-50/30 dark:bg-red-950/20"}`}
         >
           <div className="flex items-center justify-between flex-wrap gap-2">
             <div className="flex items-center gap-2 flex-wrap">
@@ -790,9 +1103,20 @@ function AuditLogPanel({
               </span>
               <ConfidenceBadge score={entry.group_avg_confidence} />
             </div>
-            <span className="text-zinc-400">
-              {new Date(entry.timestamp).toLocaleString()}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="text-zinc-400">
+                {new Date(entry.timestamp).toLocaleString()}
+              </span>
+              {onUndo && (
+                <button
+                  onClick={() => onUndo(entry)}
+                  className="p-1 text-zinc-400 hover:text-amber-600 dark:hover:text-amber-400 transition-colors"
+                  title="Undo this action"
+                >
+                  <Undo2 className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
           </div>
           {entry.decision === "approved" && (
             <>
@@ -801,27 +1125,25 @@ function AuditLogPanel({
                 <span className="font-mono text-zinc-800 dark:text-zinc-200">
                   {entry.canonical_record_id}
                 </span>
-                {" · "}Retired:{" "}
+                {" · "}
+                Retired:{" "}
                 <span className="font-mono text-zinc-800 dark:text-zinc-200">
                   {entry.retired_record_ids.join(", ")}
                 </span>
-              </div>
-              <div className="text-zinc-500">
-                {entry.source_record_count} source records
-                {entry.outlier_record_ids.length > 0 &&
-                  ` · Outliers: ${entry.outlier_record_ids.join(", ")}`}
               </div>
               <div className="grid grid-cols-3 gap-1.5 pt-1">
                 {Object.entries(entry.field_decisions).map(([field, fd]) => (
                   <div
                     key={field}
-                    className="bg-white dark:bg-zinc-900/60 rounded-lg px-2 py-1 border border-zinc-200 dark:border-zinc-700"
+                    className={`bg-white dark:bg-zinc-900/60 rounded-lg px-2 py-1 border ${fd.rule === "manual_override" ? "border-blue-200 dark:border-blue-800" : fd.rule !== (DEFAULT_FIELD_RULES[field] ?? "most_frequent") ? "border-violet-200 dark:border-violet-800" : "border-zinc-200 dark:border-zinc-700"}`}
                   >
                     <div className="text-zinc-400 truncate">{field}</div>
                     <div className="font-medium text-zinc-700 dark:text-zinc-300 truncate">
                       {String(fd.chosen_value ?? "—")}
                     </div>
-                    <div className="text-zinc-400 italic truncate">
+                    <div
+                      className={`text-[10px] italic truncate ${fd.rule === "manual_override" ? "text-blue-500" : fd.rule !== (DEFAULT_FIELD_RULES[field] ?? "most_frequent") ? "text-violet-500" : "text-zinc-400"}`}
+                    >
                       {fd.rule}
                     </div>
                   </div>
@@ -881,11 +1203,7 @@ function Pagination({
           <button
             key={p}
             onClick={() => onPageChange(p as number)}
-            className={`min-w-[28px] px-2 py-1 text-xs rounded-lg border transition-colors ${
-              currentPage === p
-                ? "bg-zinc-900 text-white border-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:border-zinc-100"
-                : "border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-            }`}
+            className={`min-w-[28px] px-2 py-1 text-xs rounded-lg border transition-colors ${currentPage === p ? "bg-zinc-900 text-white border-zinc-900 dark:bg-zinc-100 dark:text-zinc-900 dark:border-zinc-100" : "border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
           >
             {p}
           </button>
@@ -905,20 +1223,31 @@ function Pagination({
 // ─────────────────────────────────────────────────────────────
 // BATCH OUTPUT
 // ─────────────────────────────────────────────────────────────
-const BATCHES_PER_PAGE = 10;
 type SortDir = "asc" | "desc" | null;
 
 function BatchOutput({ appData }: { appData: AppData }) {
   const { records, clusters } = appData;
-
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
-  const [pageSize, setPageSize] = useState(BATCHES_PER_PAGE);
+  const [pageSize, setPageSize] = useState(10);
   const [decisions, setDecisions] = useState<Record<string, MergeDecision>>({});
   const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
   const [activeTab, setActiveTab] = useState<"clusters" | "audit">("clusters");
   const [sortDir, setSortDir] = useState<SortDir>(null);
-  const [approveAllLoading, setApproveAllLoading] = useState(false);
+  const [ruleConfig, setRuleConfig] = useState<RuleConfig>(
+    getDefaultRuleConfig(),
+  );
+  const [actionHistory, setActionHistory] = useState<Action[]>([]);
+
+  // Debounce search input
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search);
+      setCurrentPage(1);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [search]);
 
   const clusterKey = (c: Cluster) =>
     `${c.type}-${c.records[0]?.ssn ?? c.records[0]?.id ?? c.records[0]?.record_id}`;
@@ -946,14 +1275,14 @@ function BatchOutput({ appData }: { appData: AppData }) {
       field_decisions:
         decision === "approved"
           ? Object.fromEntries(
-              Object.keys(FIELD_RULES).map((f) => [
+              Object.keys(ruleConfig).map((f) => [
                 f,
                 {
                   chosen_value: effectiveCanonical[f],
                   rule:
                     overrides[f] !== undefined
                       ? "manual_override"
-                      : FIELD_RULES[f],
+                      : (ruleConfig[f]?.rule ?? "most_frequent"),
                   group_confidence: sg.group_avg_confidence,
                 },
               ]),
@@ -967,73 +1296,132 @@ function BatchOutput({ appData }: { appData: AppData }) {
     };
   };
 
+  const addToHistory = (
+    type: Action["type"],
+    clusterKey: string,
+    previousDecision: MergeDecision,
+    auditEntry?: AuditEntry,
+  ) => {
+    const newAction: Action = {
+      id: `${Date.now()}-${Math.random()}`,
+      timestamp: Date.now(),
+      type,
+      clusterKey,
+      previousDecision,
+      auditEntry,
+    };
+    setActionHistory((prev) => [newAction, ...prev].slice(0, 50)); // Keep last 50 actions
+  };
+
+  const handleUndo = (entry: AuditEntry) => {
+    // Find which cluster this entry belongs to
+    const cluster = clusters.find((c) => {
+      const key = clusterKey(c);
+      const sg = scoreGroup(c.records[0]?.ssn ?? "??", c.records, ruleConfig);
+      return sg.canonical.record_id === entry.canonical_record_id;
+    });
+
+    if (!cluster) return;
+
+    const key = clusterKey(cluster);
+    
+    // Remove from decisions (set back to pending)
+    setDecisions((prev) => {
+      const newDecisions = { ...prev };
+      delete newDecisions[key];
+      return newDecisions;
+    });
+
+    // Remove from audit log
+    setAuditLog((prev) => prev.filter((e) => e.timestamp !== entry.timestamp));
+
+    // Add undo action to history
+    addToHistory("approve", key, "approved");
+  };
+
   const handleApprove = (
     c: Cluster,
     sg: ScoredGroup,
     overrides: Record<string, any>,
   ) => {
-    setDecisions((d) => ({ ...d, [clusterKey(c)]: "approved" }));
-    setAuditLog((l) => [buildAuditEntry(c, sg, overrides, "approved"), ...l]);
+    const key = clusterKey(c);
+    const previousDecision = decisions[key] ?? "pending";
+    setDecisions((d) => ({ ...d, [key]: "approved" }));
+    const auditEntry = buildAuditEntry(c, sg, overrides, "approved");
+    setAuditLog((l) => [auditEntry, ...l]);
+    addToHistory("approve", key, previousDecision, auditEntry);
   };
 
   const handleReject = (c: Cluster, sg: ScoredGroup) => {
-    setDecisions((d) => ({ ...d, [clusterKey(c)]: "rejected" }));
-    setAuditLog((l) => [buildAuditEntry(c, sg, {}, "rejected"), ...l]);
+    const key = clusterKey(c);
+    const previousDecision = decisions[key] ?? "pending";
+    setDecisions((d) => ({ ...d, [key]: "rejected" }));
+    const auditEntry = buildAuditEntry(c, sg, {}, "rejected");
+    setAuditLog((l) => [auditEntry, ...l]);
+    addToHistory("reject", key, previousDecision, auditEntry);
   };
 
-  // Approve all 100% confidence groups
   const handleApproveAll100 = () => {
-    setApproveAllLoading(true);
     const newDecisions = { ...decisions };
     const newEntries: AuditEntry[] = [];
-    let count = 0;
+    const approvedKeys: string[] = [];
+    
     for (const c of clusters) {
       const key = clusterKey(c);
       if (newDecisions[key] && newDecisions[key] !== "pending") continue;
-      const sg = scoreGroup(c.records[0]?.ssn ?? "??", c.records);
+      const sg = scoreGroup(c.records[0]?.ssn ?? "??", c.records, ruleConfig);
       if (sg.group_avg_confidence === 100) {
         newDecisions[key] = "approved";
-        newEntries.push(buildAuditEntry(c, sg, {}, "approved"));
-        count++;
+        const auditEntry = buildAuditEntry(c, sg, {}, "approved");
+        newEntries.push(auditEntry);
+        approvedKeys.push(key);
       }
     }
+    
     setDecisions(newDecisions);
     setAuditLog((l) => [...newEntries, ...l]);
-    setApproveAllLoading(false);
+    
+    // Add a single action for the batch approve
+    if (approvedKeys.length > 0) {
+      addToHistory("approve_all", approvedKeys.join(","), "pending");
+    }
   };
 
   const filteredClusters = useMemo(() => {
     let result = clusters.filter((cluster) => {
-      if (search.trim()) {
-        const q = search.trim().toLowerCase();
-        return cluster.records.some((rec) =>
-          Object.values(rec).some((v) =>
-            String(v ?? "")
-              .toLowerCase()
-              .includes(q),
-          ),
-        );
-      }
-      return true;
+      if (!debouncedSearch.trim()) return true;
+      const q = debouncedSearch.trim().toLowerCase();
+      return cluster.records.some((rec) =>
+        Object.values(rec).some((v) =>
+          String(v ?? "")
+            .toLowerCase()
+            .includes(q),
+        ),
+      );
     });
-
     if (sortDir !== null) {
       result = [...result].sort((a, b) => {
-        const sgA = scoreGroup(a.records[0]?.ssn ?? "??", a.records);
-        const sgB = scoreGroup(b.records[0]?.ssn ?? "??", b.records);
+        const sgA = scoreGroup(
+          a.records[0]?.ssn ?? "??",
+          a.records,
+          ruleConfig,
+        );
+        const sgB = scoreGroup(
+          b.records[0]?.ssn ?? "??",
+          b.records,
+          ruleConfig,
+        );
         return sortDir === "asc"
           ? sgA.group_avg_confidence - sgB.group_avg_confidence
           : sgB.group_avg_confidence - sgA.group_avg_confidence;
       });
     }
-
     return result;
-  }, [clusters, search, sortDir]);
+  }, [clusters, debouncedSearch, sortDir, ruleConfig]);
 
   const allBatches: Cluster[][] = [];
   for (let i = 0; i < filteredClusters.length; i += 3)
     allBatches.push(filteredClusters.slice(i, i + 3));
-
   const totalPages = Math.max(1, Math.ceil(allBatches.length / pageSize));
   const safePage = Math.min(currentPage, totalPages);
   const pagedBatches = allBatches.slice(
@@ -1049,33 +1437,24 @@ function BatchOutput({ appData }: { appData: AppData }) {
     (d) => d === "rejected",
   ).length;
   const pendingCount = clusters.length - approvedCount - rejectedCount;
+  
   const count100 = clusters.filter((c) => {
     const key = clusterKey(c);
     if (decisions[key] && decisions[key] !== "pending") return false;
-    const sg = scoreGroup(c.records[0]?.ssn ?? "??", c.records);
+    const sg = scoreGroup(c.records[0]?.ssn ?? "??", c.records, ruleConfig);
     return sg.group_avg_confidence === 100;
   }).length;
 
-  const cycleSortDir = () => {
-    setSortDir((prev) =>
-      prev === null ? "desc" : prev === "desc" ? "asc" : null,
-    );
-    setCurrentPage(1);
-  };
+  const canUndo = actionHistory.length > 0;
 
   return (
     <div className="flex flex-col h-full">
-      {/* Tab bar */}
       <div className="flex border-b border-zinc-200 dark:border-zinc-800 px-6 pt-4 gap-1 shrink-0">
         {(["clusters", "audit"] as const).map((tab) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
-            className={`px-4 py-2 text-xs font-medium rounded-t-lg border-b-2 transition-colors ${
-              activeTab === tab
-                ? "border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-50"
-                : "border-transparent text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
-            }`}
+            className={`px-4 py-2 text-xs font-medium rounded-t-lg border-b-2 transition-colors ${activeTab === tab ? "border-zinc-900 dark:border-zinc-100 text-zinc-900 dark:text-zinc-50" : "border-transparent text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"}`}
           >
             {tab === "clusters"
               ? "Duplicate groups"
@@ -1090,13 +1469,12 @@ function BatchOutput({ appData }: { appData: AppData }) {
             entries={auditLog}
             allRecords={records}
             clusters={clusters}
-            decisions={decisions}
+            onUndo={handleUndo}
           />
         </div>
       ) : (
         <>
-          <div className="flex-1 overflow-y-auto p-6 space-y-6">
-            {/* Stats */}
+          <div className="flex-1 overflow-y-auto p-6 space-y-5">
             <div className="grid grid-cols-5 gap-3">
               {[
                 { label: "Total records", value: records.length, color: "" },
@@ -1133,35 +1511,36 @@ function BatchOutput({ appData }: { appData: AppData }) {
               ))}
             </div>
 
-            {/* Controls row */}
+            <RuleConfigPanel
+              ruleConfig={ruleConfig}
+              onChange={(cfg) => {
+                setRuleConfig(cfg);
+                setCurrentPage(1);
+              }}
+            />
+
             <div className="flex items-center gap-3 flex-wrap">
-              {/* Sort by confidence */}
               <button
-                onClick={cycleSortDir}
-                className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
-                  sortDir !== null
-                    ? "bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 border-zinc-900 dark:border-zinc-100"
-                    : "border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                }`}
+                onClick={() => {
+                  setSortDir((p) =>
+                    p === null ? "desc" : p === "desc" ? "asc" : null,
+                  );
+                  setCurrentPage(1);
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${sortDir !== null ? "bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 border-zinc-900 dark:border-zinc-100" : "border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800"}`}
               >
                 <ArrowUpDown className="w-3 h-3" />
                 Confidence
                 {sortDir === "asc" ? " ↑" : sortDir === "desc" ? " ↓" : ""}
               </button>
-
-              {/* Approve all 100% */}
               {count100 > 0 && (
                 <button
                   onClick={handleApproveAll100}
-                  disabled={approveAllLoading}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 transition-colors"
                 >
-                  <Zap className="w-3 h-3" />
-                  Approve all 100% ({count100})
+                  <Zap className="w-3 h-3" /> Approve all 100% ({count100})
                 </button>
               )}
-
-              {/* Search */}
               <div className="relative flex-1 max-w-xs">
                 <svg
                   className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-400"
@@ -1176,10 +1555,7 @@ function BatchOutput({ appData }: { appData: AppData }) {
                 <input
                   type="text"
                   value={search}
-                  onChange={(e) => {
-                    setSearch(e.target.value);
-                    setCurrentPage(1);
-                  }}
+                  onChange={(e) => setSearch(e.target.value)}
                   placeholder="Search records..."
                   className="w-full pl-8 pr-7 py-1.5 text-xs bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-lg text-zinc-900 dark:text-zinc-50 placeholder-zinc-400 focus:outline-none focus:border-blue-500"
                 />
@@ -1195,9 +1571,52 @@ function BatchOutput({ appData }: { appData: AppData }) {
                   </button>
                 )}
               </div>
+              {canUndo && (
+                <button
+                  onClick={() => {
+                    const lastAction = actionHistory[0];
+                    if (lastAction.type === "approve_all") {
+                      // For approve all, we need to revert all approved clusters
+                      const keys = lastAction.clusterKey.split(",");
+                      setDecisions((prev) => {
+                        const newDecisions = { ...prev };
+                        keys.forEach(key => {
+                          delete newDecisions[key];
+                        });
+                        return newDecisions;
+                      });
+                      setAuditLog((prev) => 
+                        prev.filter(e => !keys.some(key => 
+                          e.canonical_record_id === key.split("-")[1]
+                        ))
+                      );
+                    } else {
+                      // For single actions, revert the last action
+                      const key = lastAction.clusterKey;
+                      setDecisions((prev) => {
+                        const newDecisions = { ...prev };
+                        if (lastAction.previousDecision === "pending") {
+                          delete newDecisions[key];
+                        } else {
+                          newDecisions[key] = lastAction.previousDecision;
+                        }
+                        return newDecisions;
+                      });
+                      if (lastAction.auditEntry) {
+                        setAuditLog((prev) => 
+                          prev.filter(e => e.timestamp !== lastAction.auditEntry?.timestamp)
+                        );
+                      }
+                    }
+                    setActionHistory((prev) => prev.slice(1));
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-amber-500 text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-950/20 transition-colors"
+                >
+                  <Undo2 className="w-3 h-3" /> Undo last action
+                </button>
+              )}
             </div>
 
-            {/* Batch list */}
             {pagedBatches.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-16 text-zinc-400 dark:text-zinc-600">
                 <p className="text-sm">No clusters match your search.</p>
@@ -1219,6 +1638,7 @@ function BatchOutput({ appData }: { appData: AppData }) {
                             key={ci}
                             cluster={cluster}
                             decision={decisions[key] ?? "pending"}
+                            ruleConfig={ruleConfig}
                             onApprove={(sg, overrides) =>
                               handleApprove(cluster, sg, overrides)
                             }
@@ -1233,7 +1653,6 @@ function BatchOutput({ appData }: { appData: AppData }) {
             )}
           </div>
 
-          {/* Sticky pagination footer */}
           {allBatches.length > 0 && (
             <div className="border-t border-zinc-200 dark:border-zinc-800 px-6 py-3 flex items-center justify-between bg-white dark:bg-black shrink-0">
               <div className="flex items-center gap-3">
@@ -1295,7 +1714,7 @@ export default function Home() {
   const [aiLoading, setAiLoading] = useState(false);
 
   const onDrop = async (acceptedFiles: File[]) => {
-    if (acceptedFiles.length === 0) return;
+    if (!acceptedFiles.length) return;
     const file = acceptedFiles[0];
     setUploading(true);
     const reader = new FileReader();
@@ -1304,13 +1723,17 @@ export default function Home() {
         const raw = JSON.parse(e.target?.result as string);
         const records: Rec[] = Array.isArray(raw) ? raw : [raw];
         const clusters = getCandidateClusters(records);
-        const batches = makeBatches(clusters);
-        setAppData({ records, clusters, batches, fileName: file.name });
+        setAppData({
+          records,
+          clusters,
+          batches: makeBatches(clusters),
+          fileName: file.name,
+        });
         setMessages((prev) => [
           ...prev,
           {
             id: Date.now().toString(),
-            text: `Loaded ${records.length} records. Found ${clusters.length} duplicate group(s). Expand the green panel to review field decisions — you can override any field with the dropdowns. Use "Approve all 100%" to instantly approve high-confidence groups.`,
+            text: `Loaded ${records.length} records — found ${clusters.length} duplicate group(s). Configure field rules before approving, or use "Approve all 100%" to instantly merge high-confidence groups.`,
             sender: "ai",
           },
         ]);
@@ -1359,7 +1782,6 @@ export default function Home() {
 
   return (
     <div className="flex flex-1 h-[calc(100vh-64px)] bg-white dark:bg-black">
-      {/* Left Sidebar */}
       <div className="sticky top-0 left-0 max-h-screen w-64 border-r border-zinc-200 dark:border-zinc-800 p-6 flex flex-col gap-6 overflow-y-auto">
         <div>
           <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50 mb-4">
@@ -1367,11 +1789,7 @@ export default function Home() {
           </h3>
           <div
             {...getRootProps()}
-            className={`flex flex-col items-center justify-center w-full p-6 border-2 border-dashed rounded-xl cursor-pointer transition-colors ${
-              isDragActive
-                ? "border-blue-500 bg-blue-50 dark:bg-blue-950"
-                : "border-zinc-300 dark:border-zinc-600 hover:border-zinc-400 dark:hover:border-zinc-500"
-            }`}
+            className={`flex flex-col items-center justify-center w-full p-6 border-2 border-dashed rounded-xl cursor-pointer transition-colors ${isDragActive ? "border-blue-500 bg-blue-50 dark:bg-blue-950" : "border-zinc-300 dark:border-zinc-600 hover:border-zinc-400 dark:hover:border-zinc-500"}`}
           >
             <input {...getInputProps()} />
             <div className="flex flex-col items-center justify-center pt-5 pb-6">
@@ -1392,10 +1810,8 @@ export default function Home() {
             </p>
             <p>{appData.records.length} records</p>
             <p>{appData.clusters.length} duplicate groups</p>
-            <p>{appData.batches.length} batches</p>
           </div>
         )}
-        {/* Export note */}
         <div className="text-xs text-zinc-400 dark:text-zinc-600 space-y-1 border-t border-zinc-200 dark:border-zinc-800 pt-4">
           <p className="font-medium text-zinc-500 dark:text-zinc-500">
             Exports (from Audit Log)
@@ -1406,14 +1822,13 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Center */}
       <div className="flex-1 flex flex-col overflow-hidden">
         <div className="border-b border-zinc-200 dark:border-zinc-800 p-6 shrink-0">
           <h1 className="text-2xl font-bold text-zinc-900 dark:text-zinc-50">
             Duplicate Detection System
           </h1>
-          <p className="text-zinc-600 dark:text-zinc-400 mt-2">
-            Upload a JSON file to cluster, score, and merge duplicate records
+          <p className="text-zinc-600 dark:text-zinc-400 mt-1 text-sm">
+            Configure rules · score confidence · review & merge
           </p>
         </div>
         <div className="flex-1 overflow-hidden flex flex-col">
@@ -1435,7 +1850,6 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Right Sidebar - AI Chat */}
       <div className="max-h-screen sticky top-0 right-0 w-80 border-l border-zinc-200 dark:border-zinc-800 flex flex-col bg-zinc-50 dark:bg-zinc-950">
         <div className="border-b border-zinc-200 dark:border-zinc-800 p-4">
           <h3 className="text-lg font-semibold text-zinc-900 dark:text-zinc-50">
@@ -1452,11 +1866,7 @@ export default function Home() {
               className={`flex ${msg.sender === "user" ? "justify-end" : "justify-start"}`}
             >
               <div
-                className={`max-w-xs px-4 py-2 rounded-xl text-sm ${
-                  msg.sender === "user"
-                    ? "bg-blue-600 text-white rounded-br-none"
-                    : "bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-50 rounded-bl-none border border-zinc-200 dark:border-zinc-700"
-                }`}
+                className={`max-w-xs px-4 py-2 rounded-xl text-sm ${msg.sender === "user" ? "bg-blue-600 text-white rounded-br-none" : "bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-50 rounded-bl-none border border-zinc-200 dark:border-zinc-700"}`}
               >
                 {msg.text}
               </div>
